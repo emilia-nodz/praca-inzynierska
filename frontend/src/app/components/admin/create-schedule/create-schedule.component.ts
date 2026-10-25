@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, inject } from '@angular/core';
+import { ChangeDetectionStrategy, ChangeDetectorRef, Component, inject } from '@angular/core';
 import { ScheduleService } from '../../../services/schedule.service';
 import { MAT_DIALOG_DATA, MatDialogModule, MatDialogRef } from '@angular/material/dialog';
 import { DialogData } from '../../../models/dialog-data';
@@ -9,16 +9,18 @@ import { MatIcon } from '@angular/material/icon';
 import { MatDatepickerModule } from '@angular/material/datepicker';
 import { MAT_DATE_LOCALE } from '@angular/material/core';
 import { provideMomentDateAdapter } from '@angular/material-moment-adapter';
-import { Observable, of, switchMap } from 'rxjs';
+import { Observable } from 'rxjs';
 import { Company } from '../../../models/company';
 import { CompanyService } from '../../../services/company.service';
-import { OptimizedShift } from '../../../models/optaplanner/optimized-shifts';
 import {MatProgressSpinnerModule} from '@angular/material/progress-spinner';
 import { checkIfMonday } from '../../../validators/date.validator';
+import { MatSelectModule } from '@angular/material/select';
+import { BranchOffice } from '../../../models/branch-office';
+import { BranchOfficeService } from '../../../services/branch-office.service';
 
 @Component({
   selector: 'app-create-schedule',
-  imports: [MatDialogModule, MatFormField, ReactiveFormsModule, MatLabel, MatInputModule, MatHint, MatDatepickerModule, MatProgressSpinnerModule],
+  imports: [MatDialogModule, MatFormField, ReactiveFormsModule, MatLabel, MatInputModule, MatHint, MatDatepickerModule, MatProgressSpinnerModule, MatSelectModule],
   providers: [
     { provide: MAT_DATE_LOCALE, useValue: 'pl' },
     provideMomentDateAdapter({
@@ -40,12 +42,12 @@ import { checkIfMonday } from '../../../validators/date.validator';
 export class CreateScheduleComponent {
 
   readonly dialogRef = inject(MatDialogRef<CreateScheduleComponent>);
+  private cdr = inject(ChangeDetectorRef);
 
   formModel: FormGroup;
   currentCompany: Company | undefined;
+  branchOffices: BranchOffice[] = [];
   isGenerating = false;
-  isOptimizing = false;
-  currentStep: "idle" | "generating" | "optimizing" | "completed" = "idle";
 
   get currentCompany$(): Observable<Company | null> {
     return this.companyService.currentCompany;
@@ -55,15 +57,26 @@ export class CreateScheduleComponent {
     private scheduleService: ScheduleService,
     private alertService: AlertService,
     private companyService: CompanyService,
+    private branchOfficeService: BranchOfficeService,
     private formBuilder: FormBuilder
   ) {
     this.formModel = this.formBuilder.group({
+      branchOfficeId: [null, Validators.required],
       startTime: [null, [Validators.required, checkIfMonday]]
     })
 
     this.currentCompany$.subscribe(c => {
       if (c !== null) {
         this.currentCompany = c;
+        if (c.id) {
+          this.branchOfficeService.getBranchOfficesByCompany(c.id).subscribe(data => {
+            this.branchOffices = data;
+            if (data.length === 1) {
+              this.formModel.patchValue({ branchOfficeId: data[0].id });
+            }
+            this.cdr.markForCheck();
+          });
+        }
       }
     });
   }
@@ -79,52 +92,30 @@ export class CreateScheduleComponent {
     return `${year}-${month}-${day}`;
   }
 
-  private formatToISOStartDateTime(date: Date): string {
-    return `${this.formatDate(date)}T00:00:00`;
-  }
-
-  private formatToISOEndDateTime(date: Date): string {
-    return `${this.formatDate(date)}T23:59:59`;
-  }
-
   createSchedule() {
-    if (this.currentCompany != null && this.currentCompany?.id && this.formModel.valid) {
+    if (this.formModel.invalid) {
+      this.formModel.markAllAsTouched();
+      return;
+    }
+    if (!this.isGenerating) {
       this.isGenerating = true;
-      const startDate = this.formModel.value.startTime;
-      const endDate = new Date(startDate);
-      endDate.setDate(endDate.getDate() + 6);
+      const startDateStr = this.formatDate(this.formModel.value.startTime);
 
-      const startDateStr = this.formatDate(startDate);
-
-      const startDateTime = this.formatToISOStartDateTime(startDate);
-      const endDateTime = this.formatToISOEndDateTime(endDate);
-
-      this.scheduleService.generateShifts(this.currentCompany.id, startDateStr).pipe(
-        switchMap(response => {
+      this.scheduleService.generateShifts(this.formModel.value.branchOfficeId, startDateStr).subscribe({
+        next: (response) => {
           this.isGenerating = false;
+          this.cdr.markForCheck();
+
           this.alertService.success(response.message);
-
-          this.isOptimizing = true;
-          if (this.currentCompany?.id) {
-            return this.scheduleService.optimizeSchedule(this.currentCompany.id, startDateTime, endDateTime);
-          }
-          return of();
-        })
-      )
-      .subscribe({
-        next: (optimizeResponse) => {
-          this.isOptimizing = false;
-
-          this.alertService.success(`${optimizeResponse.message}`);
           this.dialogRef.close();
         },
         error: (error) => {
           this.isGenerating = false;
-          this.isOptimizing = false;
+          this.cdr.markForCheck();
 
           console.error("Error", error);
 
-          const errorMessage = error.error?.message || error.message || "Wystąpił błąd";
+          const errorMessage = error.error?.message || error.error?.detail || error.message || "Wystąpił błąd";
           this.alertService.error(errorMessage);
         }
       })
@@ -132,15 +123,12 @@ export class CreateScheduleComponent {
   }
 
   isProcessing(): boolean {
-    return this.isGenerating || this.isOptimizing;
+    return this.isGenerating;
   }
 
   getStatusMessage(): string {
     if (this.isGenerating) {
       return "Generowanie zmian...";
-    }
-    if (this.isOptimizing) {
-      return "Optymalizacja w toku...";
     }
     return "Stwórz grafik";
   }
